@@ -421,3 +421,76 @@ class HandoverVoucherListResponse(BaseModel):
     vouchers: List[HandoverVoucherOut] = Field(
         description="该设备全部交接凭证，按生成时间、交接单号排序"
     )
+
+
+# ---------------------------------------------------------------- 累计温度暴露评估
+
+class ExposureAssessmentIn(BaseModel):
+    """累计温度暴露评估请求体：左闭右开时间窗 + 最大沿用间隔 + 允许暴露量。"""
+
+    window_start: datetime = Field(description="评估时间窗起点（含，左闭）")
+    window_end: datetime = Field(description="评估时间窗终点（不含，右开；必须晚于起点）")
+    max_interval_minutes: float = Field(
+        description="最大读数沿用间隔（分钟）：读数温度自采样时刻起最多沿用该时长，"
+        "须为正数且有限"
+    )
+    exposure_budget: float = Field(
+        description="允许暴露量（℃·分钟）：须为非负且有限"
+    )
+
+    @field_validator("max_interval_minutes")
+    @classmethod
+    def interval_positive_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("max_interval_minutes must be a finite number")
+        if v <= 0:
+            raise ValueError("max_interval_minutes must be positive")
+        return v
+
+    @field_validator("exposure_budget")
+    @classmethod
+    def budget_non_negative_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("exposure_budget must be a finite number")
+        if v < 0:
+            raise ValueError("exposure_budget must be non-negative")
+        return v
+
+    @model_validator(mode="after")
+    def window_end_after_start(self):
+        # 与交接凭证同一口径：先归一化为 aware datetime 再比较，
+        # naive / aware 混用与等价时区表示都能正确判定先后
+        start = self.window_start
+        end = self.window_end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if end.astimezone(timezone.utc) <= start.astimezone(timezone.utc):
+            raise ValueError(
+                "window_end must be strictly later than window_start "
+                "(window is half-open [window_start, window_end))"
+            )
+        return self
+
+
+class ExposureAssessmentResponse(BaseModel):
+    """累计温度暴露评估结果：已观测 / 未知分钟、累计暴露量与结论。"""
+
+    device_id: str
+    window_start: str = Field(description="规范化（UTC）后的评估窗起点（含）")
+    window_end: str = Field(description="规范化（UTC）后的评估窗终点（不含）")
+    max_interval_minutes: float = Field(description="本次评估使用的最大沿用间隔（分钟）")
+    exposure_budget: float = Field(description="本次评估使用的允许暴露量（℃·分钟）")
+    limit: float = Field(description="全局默认上限（无策略覆盖的时间沿用该值）")
+    observed_minutes: float = Field(
+        description="窗内被有效读数（含沿用）覆盖的分钟数"
+    )
+    unknown_minutes: float = Field(description="窗内无任何读数覆盖的分钟数")
+    exposure: float = Field(
+        description="累计暴露量（℃·分钟）：逐段 max(温度 - 适用上限, 0) × 分钟之和，未舍入"
+    )
+    verdict: Literal["pass", "fail", "insufficient_evidence"] = Field(
+        description="结论：fail=暴露量超过预算；insufficient_evidence=未超过但有未知时间；"
+        "pass=其余（合格）"
+    )
