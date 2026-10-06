@@ -25,6 +25,13 @@
 同设备同单号、等价时区表示的同一时间窗重试原样返回首次凭证，异窗冲突；
 凭证一经存档，后续补报、更正、撤销或策略变化都不再改动它。
 
+冷链运输方还可按设备与时间窗**评估累计温度暴露**：提交时间窗（左闭右开）、
+最大读数沿用间隔与允许暴露量（预算），服务按“温度自采样时刻保持至下一条
+有效读数或沿用间隔届满”的口径划分已观测 / 未知分钟，按时间点适用的温度
+上限策略在切换点拆段，逐段累计 `max(温度-上限, 0) × 分钟`（未舍入值与
+预算比较），返回已观测分钟、未知分钟、累计暴露量与结论（合格 / 证据不足 /
+不合格）；评估**只读最新状态**，不改动任何读数、策略、区间与交接凭证。
+
 ## 超温区间判定规则
 
 - 同一设备的**有效**（未撤销）读数按 **(采样时间, 事件号)** 升序排列；
@@ -99,6 +106,7 @@ Compose 中通过 `environment` 修改，例如 `TEMP_LIMIT: "2.0"`。
 | POST   | `/devices/{device_id}/handover-vouchers` | 生成 / 重放冷链交接温控凭证（同窗幂等，异窗 409） |
 | GET    | `/devices/{device_id}/handover-vouchers` | 查询设备全部交接凭证（按生成时间排序）       |
 | GET    | `/devices/{device_id}/handover-vouchers/{handover_no}` | 按交接单号查询凭证（未知单号 404） |
+| POST   | `/devices/{device_id}/exposure-assessments` | 按时间窗评估累计温度暴露（只读，不合格 / 证据不足 / 合格） |
 | GET    | `/health`                               | 健康检查                                   |
 
 ### 请求字段
@@ -433,6 +441,8 @@ curl $BASE/disputes/D1              # 单个争议（含冻结依据、终态、
 - 新增凭证表 `handover_vouchers` 只在凭证接口写入，且仅插入新行、从不更新 / 删除；
   凭证生成不改动任何读数 / 区间 / 策略 / 批次 / 争议数据，既有接口的请求、响应与
   幂等语义完全不变；已存凭证为生成时刻快照，后续任何数据变化都不会改写它；
+- 累计温度暴露评估为**只读接口**：不新增任何表，也不写入 / 更新 / 删除任何数据，
+  读数、策略、区间、批次、争议与交接凭证接口的请求、响应与幂等语义完全不变；
 - 升级旧版本数据库时自动幂等迁移：旧读数补列 `revision = 1`，新表自动创建，
   无需手工脚本，现有 `uvicorn app.main:app` 启动方式保持可用。
 
@@ -671,15 +681,152 @@ curl $BASE/handover-vouchers             # 全部凭证（按生成时间排序�
 curl $BASE/handover-vouchers/HO-001      # 按交接单号查询（未知单号 404）
 ```
 
+## 累计温度暴露评估
+
+冷链运输方按设备与时间窗评估累计温度暴露（℃·分钟）。评估**只读取当前最新
+状态**，不写入任何数据，因此不改动现有读数、策略、超温区间、批次回执、
+争议与交接凭证；每次请求都按当时最新数据即时计算（评估结果不存档、不冻结）。
+
+### 口径与规则
+
+- 时间窗为**左闭右开** `[window_start, window_end)`（含起点、不含终点），
+  时间支持 ISO 8601 与等价时区表示，服务统一归一化为 UTC 后计算；
+- 仅**未撤销**读数有效；同一采样时刻存在多条有效读数时，以**事件号最大者**
+  为准（事件号按字符串比较）；
+- **温度沿用**：每条有效读数的温度自其采样时刻起保持，至**下一条有效读数
+  的采样时刻**或**采样时刻 + 最大沿用间隔** `max_staleness_minutes` 届满
+  为止（两者先到为准），形成左闭右开的“已知温度段”；
+- **窗前最近一条有效读数**的已知段同样可覆盖窗头（窗外部分裁掉）；
+  窗内未被任何已知温度段覆盖的时间记为**未知分钟**；
+- **温度上限按时间点适用**：每个时刻用“生效时间不晚于该时刻的最近一条
+  策略”的上限，无策略覆盖时沿用全局 `TEMP_LIMIT`；策略切换点把已知温度段
+  拆成小段，各小段内上限恒定；
+- **逐小段累计** `max(温度 - 上限, 0) × 分钟数`；全程使用**未舍入**的浮点
+  值（不先舍入每段或总和），并以该未舍入累计值与预算比较；
+- 结论（`conclusion`）：
+  - `fail`（不合格）：累计暴露量**严格超过** `exposure_budget`（等于不算超过）；
+  - `insufficient_evidence`（证据不足）：未超过预算，但窗内存在未知分钟；
+  - `pass`（合格）：未超过预算且全窗均已观测；
+  - 即“超预算”判定优先于“证据不足”；
+- **已知设备**（曾上报过读数，即使读数后来全部撤销）若无有效读数，全窗
+  记未知、结论为证据不足；**未知设备**（从未上报读数）返回 `404`。
+
+### 请求 `POST /devices/{device_id}/exposure-assessments`
+
+```json
+{
+  "window_start": "2026-10-01T08:00:00Z",
+  "window_end":   "2026-10-01T09:00:00Z",
+  "max_staleness_minutes": 15,
+  "exposure_budget": 100.0
+}
+```
+
+| 字段                     | 说明                                                            |
+| ------------------------ | --------------------------------------------------------------- |
+| `window_start`           | 评估时间窗起点（含），ISO 8601，无时区按 UTC                     |
+| `window_end`             | 评估时间窗终点（不含），必须**严格晚于**起点                    |
+| `max_staleness_minutes`  | 最大读数沿用间隔，**正数**分钟                                  |
+| `exposure_budget`        | 允许的累计暴露量，**非负** ℃·分钟，严格超过即不合格             |
+
+### 响应 `200 OK`
+
+```json
+{
+  "device_id": "truck-001",
+  "window_start": "2026-10-01T08:00:00.000000Z",
+  "window_end":   "2026-10-01T09:00:00.000000Z",
+  "window_minutes": 60.0,
+  "max_staleness_minutes": 15.0,
+  "exposure_budget": 100.0,
+  "limit": 8.0,
+  "observed_minutes": 25.0,
+  "unknown_minutes": 35.0,
+  "cumulative_exposure": 35.0,
+  "conclusion": "insufficient_evidence"
+}
+```
+
+- `observed_minutes`：窗内被有效读数温度（沿用间隔内）覆盖的分钟数；
+- `unknown_minutes`：窗内无有效读数温度可沿用的分钟数；
+  `window_minutes = observed_minutes + unknown_minutes`；
+- `cumulative_exposure`：逐段累计的暴露量（℃·分钟，**未舍入**）；
+- `conclusion`：`pass` / `insufficient_evidence` / `fail`。
+
+### 错误
+
+| 状态码 | 场景                                                                 |
+| ------ | -------------------------------------------------------------------- |
+| `404`  | 未知设备（从未上报过任何读数）                                       |
+| `422`  | 非法时间格式；时间窗结束不晚于开始；`max_staleness_minutes` 非有限数值或非正；`exposure_budget` 非有限数值或为负；缺字段 |
+
+### 评估接口示例
+
+```bash
+BASE=http://localhost:8000/devices/truck-001
+
+# 0. 准备读数与策略（沿用既有接口）：
+#    07:55 的读数 10.0（可覆盖窗头到 08:10），08:10 的读数 9.0（盖到 08:25）；
+#    08:05 起策略上限降到 5.0
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E1","sampled_at":"2026-10-01T07:55:00Z","temperature":10.0}'
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E2","sampled_at":"2026-10-01T08:10:00Z","temperature":9.0}'
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P1","effective_from":"2026-10-01T08:05:00Z","temp_limit":5.0}'
+
+# 1. 评估 [08:00, 09:00)，沿用间隔 15 分钟，预算 100 ℃·分钟
+#    已观测 25 分钟、未知 35 分钟：
+#    [08:00,08:05) 全局 8.0：(10-8)*5 = 10
+#    [08:05,08:10) 策略 5.0：(10-5)*5 = 25
+#    [08:10,08:25) 策略 5.0：(9-5)*15 = 60
+#    累计 95 ≤ 100 但有未知时间 → insufficient_evidence
+curl -X POST $BASE/exposure-assessments -H 'Content-Type: application/json' -d '{
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z",
+  "max_staleness_minutes":15,
+  "exposure_budget":100}'
+
+# 2. 预算压低到 90 → 95 > 90，fail（即使窗内仍有未知时间，超预算优先）
+curl -X POST $BASE/exposure-assessments -H 'Content-Type: application/json' -d '{
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z",
+  "max_staleness_minutes":15,
+  "exposure_budget":90}'
+
+# 3. 沿用间隔拉长到 60 分钟：08:10 的读数盖到窗尾，全窗已观测；
+#    [08:25,09:00) 用 9.0/5.0 计 4*35=140，累计 235，fail
+curl -X POST $BASE/exposure-assessments -H 'Content-Type: application/json' -d '{
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z",
+  "max_staleness_minutes":60,
+  "exposure_budget":1000}'
+
+# 4. 等价时区表示的同一时间窗 → 结果完全一致
+curl -X POST $BASE/exposure-assessments -H 'Content-Type: application/json' -d '{
+  "window_start":"2026-10-01T16:00:00+08:00",
+  "window_end":"2026-10-01T17:00:00+08:00",
+  "max_staleness_minutes":15,
+  "exposure_budget":100}'
+
+# 5. 未知设备 → 404；非法参数 → 422
+curl -X POST /devices/ghost/exposure-assessments -H 'Content-Type: application/json' \
+  -d '{"window_start":"2026-10-01T08:00:00Z","window_end":"2026-10-01T09:00:00Z",
+       "max_staleness_minutes":15,"exposure_budget":100}'
+curl -X POST $BASE/exposure-assessments -H 'Content-Type: application/json' \
+  -d '{"window_start":"2026-10-01T09:00:00Z","window_end":"2026-10-01T09:00:00Z",
+       "max_staleness_minutes":0,"exposure_budget":-1}'
+```
+
 ## 错误码
 
 | 状态码 | 场景                                                                 |
 | ------ | -------------------------------------------------------------------- |
-| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试、策略同号同内容重放、交接凭证同窗重试 / 查询） |
+| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试、策略同号同内容重放、交接凭证同窗重试 / 查询、累计温度暴露评估） |
 | 201    | 争议首次申请成功；批次首次提交成功；策略首次写入成功；交接凭证首次生成成功 |
-| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号；向未知设备（无任何读数）提交策略；查询未知交接单号 |
+| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号；向未知设备（无任何读数）提交策略；查询未知交接单号；对未知设备评估累计温度暴露 |
 | 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝）；同策略号异内容；同设备同一生效时间的策略重复；同交接单号请求不同时间窗 |
-| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号；非法策略号 / 生效时间 / 策略阈值；非法交接单号 / 时间格式、时间窗结束不晚于开始 |
+| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号；非法策略号 / 生效时间 / 策略阈值；非法交接单号 / 时间格式、时间窗结束不晚于开始；暴露评估的时间窗非法、`max_staleness_minutes` 非有限数值或非正、`exposure_budget` 非有限数值或为负 |
 
 错误响应体均含 `detail` 字段说明原因。
 
@@ -694,9 +841,10 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、温度上限策略、交接温控凭证、错误处理
+  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、温度上限策略、交接温控凭证、累计温度暴露评估、错误处理
   intervals.py  # 区间计算（单上限 / 按策略逐读数上限）、适用策略查找与差异比对（纯函数）
-  models.py     # 请求/响应模型与输入校验（含批次、争议、策略、交接凭证模型）
+  exposure.py   # 累计温度暴露评估（读数沿用成段、同时刻事件号最大者、策略切换拆段、逐段未舍入累计与结论判定，纯函数）
+  models.py     # 请求/响应模型与输入校验（含批次、争议、策略、交接凭证、暴露评估模型）
   db.py         # SQLite 连接、建表（读数 / 争议 / 批次 / 策略 / 交接凭证）与旧库 revision 增量迁移
   config.py     # 环境变量配置
   util.py       # 时间规范化（UTC、固定宽度，保证可排序）
@@ -706,5 +854,6 @@ tests/
   test_disputes.py         # 争议工作流测试（冻结、批准 / 驳回、过期、幂等、迁移）
   test_policies.py         # 温度上限策略测试（回溯重算、多策略时序、幂等、冲突、错误、隔离）
   test_handover_vouchers.py # 交接温控凭证测试（窗口边界、逐条冻结、汇总、幂等 / 冲突、出证后不变性、校验、查询、隔离）
+  test_exposure.py         # 累计温度暴露评估测试（窗头覆盖 / 沿用届满未知、策略拆段、同时刻取舍、结论优先级、404 / 422、只读与隔离）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

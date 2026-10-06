@@ -1,6 +1,6 @@
 """请求 / 响应数据模型与输入校验。"""
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -420,4 +420,101 @@ class HandoverVoucherListResponse(BaseModel):
     device_id: str
     vouchers: List[HandoverVoucherOut] = Field(
         description="该设备全部交接凭证，按生成时间、交接单号排序"
+    )
+
+
+# ---------------------------------------------------------------- 累计温度暴露评估
+
+ExposureConclusion = Literal["pass", "insufficient_evidence", "fail"]
+
+
+class ExposureAssessmentIn(BaseModel):
+    """累计温度暴露评估请求体：左闭右开时间窗 + 最大沿用间隔 + 暴露预算。
+
+    评估只读取当前最新状态，不写入、不改动任何区间 / 凭证 / 读数 / 策略。
+    """
+
+    window_start: datetime = Field(description="评估时间窗起点（含，左闭）")
+    window_end: datetime = Field(description="评估时间窗终点（不含，右开；必须晚于起点）")
+    max_staleness_minutes: float = Field(
+        description=(
+            "最大读数沿用间隔（正数分钟）：每条读数温度自采样时刻保持至下一条"
+            "有效读数或该间隔届满（先到为准）"
+        )
+    )
+    exposure_budget: float = Field(
+        description="允许的累计温度暴露量（非负 ℃·分钟），严格超过即不合格"
+    )
+
+    @field_validator("max_staleness_minutes", "exposure_budget")
+    @classmethod
+    def values_must_be_finite(cls, v: float) -> float:
+        # JSON 数字经解析后仍须显式拒绝 inf / -inf / NaN
+        if not math.isfinite(v):
+            raise ValueError("value must be a finite number")
+        return v
+
+    @field_validator("max_staleness_minutes")
+    @classmethod
+    def staleness_must_be_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("max_staleness_minutes must be a positive number of minutes")
+        try:
+            # 有限但大到 timedelta 无法表示的正数同样没有物理意义，按非法处理
+            timedelta(minutes=v)
+        except OverflowError:
+            raise ValueError("max_staleness_minutes is too large")
+        return v
+
+    @field_validator("exposure_budget")
+    @classmethod
+    def budget_must_be_non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("exposure_budget must be non-negative (°C·minutes)")
+        return v
+
+    @model_validator(mode="after")
+    def window_end_after_start(self):
+        # 先归一化为 aware datetime（无时区按 UTC），再比较；
+        # 与交接凭证同一口径，等价时区表示的同一时间窗视为同窗。
+        start = self.window_start
+        end = self.window_end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if end.astimezone(timezone.utc) <= start.astimezone(timezone.utc):
+            raise ValueError(
+                "window_end must be strictly later than window_start "
+                "(window is half-open [window_start, window_end))"
+            )
+        return self
+
+
+class ExposureAssessmentResponse(BaseModel):
+    """累计温度暴露评估结果。"""
+
+    device_id: str
+    window_start: str = Field(description="规范化（UTC）后的时间窗起点（含）")
+    window_end: str = Field(description="规范化（UTC）后的时间窗终点（不含）")
+    window_minutes: float = Field(
+        description="时间窗总分钟数（= 已观测分钟 + 未知分钟）"
+    )
+    max_staleness_minutes: float = Field(description="回显的最大读数沿用间隔（分钟）")
+    exposure_budget: float = Field(description="回显的允许暴露量（℃·分钟）")
+    limit: float = Field(description="全局默认上限（无策略覆盖的时间按它判定）")
+    observed_minutes: float = Field(
+        description="已观测分钟数：窗内被有效读数温度（在沿用间隔内）覆盖的时间"
+    )
+    unknown_minutes: float = Field(
+        description="未知分钟数：窗内无有效读数温度可沿用的时间"
+    )
+    cumulative_exposure: float = Field(
+        description="逐段累计的 max(温度-上限,0)×分钟（℃·分钟），未舍入值"
+    )
+    conclusion: ExposureConclusion = Field(
+        description=(
+            "评估结论：fail=暴露量严格超过预算；"
+            "insufficient_evidence=未超过但存在未知分钟；pass=未超过且全窗已知"
+        )
     )

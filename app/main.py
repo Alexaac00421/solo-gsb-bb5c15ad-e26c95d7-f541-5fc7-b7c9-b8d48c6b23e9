@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .db import connect, init_db
+from .exposure import assess_exposure
 from .intervals import applicable_policy, compute_intervals_with_policies, diff_intervals
 from .models import (
     BatchIn,
@@ -19,6 +20,8 @@ from .models import (
     DisputeIn,
     DisputeListResponse,
     DisputeResponse,
+    ExposureAssessmentIn,
+    ExposureAssessmentResponse,
     HandoverVoucherIn,
     HandoverVoucherListResponse,
     HandoverVoucherResponse,
@@ -45,7 +48,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷链运输温度事件核验服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "按设备提交 / 更正 / 撤销温度读数，自动核验并维护超温区间。"
         "连续两次有效读数超过上限即形成超温区间，区间以起点事件号标识。"
@@ -61,6 +64,12 @@ app = FastAPI(
         "逐条冻结事件号、时间、温度、当时适用的策略号与上限及是否严格超限，"
         "凭证生成与证据存档同一事务完成，同单号等价时间窗重试原样返回"
         "首次凭证，异窗冲突；已存凭证不受后续补报 / 更正 / 撤销 / 策略变化影响。"
+        "冷链运输方可按设备与时间窗（左闭右开）评估累计温度暴露：读数温度"
+        "自采样时刻沿用至下一条有效读数或最大沿用间隔届满，窗前最近读数"
+        "可覆盖窗头，其余时间记未知；上限按时间点适用最近生效策略并在切换"
+        "时拆段，逐段累计 max(温度-上限,0)×分钟（未舍入比较预算），"
+        "返回已观测 / 未知分钟、累计暴露量与结论；评估只读最新状态，"
+        "不改动任何读数、策略、区间与交接凭证。"
     ),
     lifespan=lifespan,
 )
@@ -765,6 +774,65 @@ def get_handover_voucher(
     return {"voucher": json.loads(row["voucher"])}
 
 
+# ---------------------------------------------------------------- 累计温度暴露评估
+
+@app.post(
+    "/devices/{device_id}/exposure-assessments",
+    response_model=ExposureAssessmentResponse,
+    summary="按设备与时间窗评估累计温度暴露（只读最新状态，不写入任何数据）",
+)
+def assess_device_exposure(
+    device_id: str,
+    body: ExposureAssessmentIn,
+    settings: Settings = Depends(get_settings),
+):
+    # 时间窗端点统一规范化为 UTC 后再评估（与采样时间同一口径，
+    # 等价时区表示的同一时间窗得到完全相同的结果）
+    window_start = to_utc_iso(body.window_start)
+    window_end = to_utc_iso(body.window_end)
+
+    with connect(settings.db_path) as conn:
+        # 设备由已提交的读数隐式定义：从未上报读数的设备视为未知设备
+        known = conn.execute(
+            "SELECT 1 FROM readings WHERE device_id = ? LIMIT 1",
+            (device_id,),
+        ).fetchone()
+        if known is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"device '{device_id}' not found: "
+                    f"no readings have been submitted for it"
+                ),
+            )
+        # 纯读取：评估取最新状态，不改变区间 / 凭证 / 批次 / 争议等任何数据
+        readings = _load_valid_readings(conn, device_id)
+        policies = _load_policies(conn, device_id)
+
+    result = assess_exposure(
+        readings,
+        policies,
+        settings.temp_limit,
+        window_start,
+        window_end,
+        body.max_staleness_minutes,
+        body.exposure_budget,
+    )
+    return {
+        "device_id": device_id,
+        "window_start": window_start,
+        "window_end": window_end,
+        "window_minutes": result.window_minutes,
+        "max_staleness_minutes": body.max_staleness_minutes,
+        "exposure_budget": body.exposure_budget,
+        "limit": settings.temp_limit,
+        "observed_minutes": result.observed_minutes,
+        "unknown_minutes": result.unknown_minutes,
+        "cumulative_exposure": result.cumulative_exposure,
+        "conclusion": result.conclusion,
+    }
+
+
 # ---------------------------------------------------------------- 争议工作流
 
 def _get_dispute(conn, device_id: str, dispute_no: str):
@@ -1153,7 +1221,7 @@ def health():
 def root(settings: Settings = Depends(get_settings)):
     return {
         "service": "coldchain-temperature-verification",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "temp_limit": settings.temp_limit,
         "docs": "/docs",
     }
